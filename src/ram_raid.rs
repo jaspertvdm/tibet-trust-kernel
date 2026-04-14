@@ -452,42 +452,6 @@ impl RamRaidController {
         }
     }
 
-    pub fn new(config: RaidConfig) -> Self {
-        let block_count = config.block_count();
-        let mut blocks = Vec::with_capacity(block_count);
-
-        for i in 0..block_count {
-            blocks.push(RaidBlock {
-                index: i,
-                stripe: RaidStripe::from_block_index(i),
-                va_offset: i * config.block_size,
-                size: config.block_size,
-                location: BlockLocation::Virgin,
-                content_hash: None,
-                seal: None,
-                access_count: 0,
-                last_access_ns: 0,
-                write_count: 0,
-                dirty: false,
-            });
-        }
-
-        Self {
-            config,
-            blocks,
-            resident_count: AtomicU64::new(0),
-            faults_handled: AtomicU64::new(0),
-            evictions_performed: AtomicU64::new(0),
-            bytes_compressed: AtomicU64::new(0),
-            bytes_decompressed: AtomicU64::new(0),
-            remote_transfers: AtomicU64::new(0),
-            zero_pages_served: AtomicU64::new(0),
-            active: AtomicBool::new(true),
-            bus_seq: AtomicU64::new(0),
-            lru_clock: AtomicU64::new(0),
-        }
-    }
-
     /// TIBET-Store MMU: Transformeert deze logische RAID-0 controller in een echte hardware MMU-trap.
     /// Dit combineert de bewezen tibet-store-mmu logica met de Trust Kernel UPIP pager.
     pub fn start_production(self) -> Option<ActiveRamRaid> {
@@ -540,6 +504,7 @@ impl RamRaidController {
         let u_clone = uffd.clone();
 
         // 3. De Archivaris / Fault Handler Thread
+        let addr_usize = addr as usize;
         let fault_thread = thread::spawn(move || {
             loop {
                 // Check if controller is still active
@@ -549,7 +514,7 @@ impl RamRaidController {
 
                 match u_clone.read_event() {
                     Ok(Some(Event::Pagefault { addr: fault_addr, .. })) => {
-                        let offset = fault_addr as usize - addr as usize;
+                        let offset = fault_addr as usize - addr_usize;
                         let mut lock = c_clone.lock().unwrap();
                         
                         // Hier zit de magische koppeling: We sturen de page fault naar onze RAM RAID logica!
@@ -557,6 +522,7 @@ impl RamRaidController {
                         
                         // Nu lossen we de fysieke injectie op:
                         let fault_addr_aligned = (fault_addr as usize / page_size) * page_size;
+                        let _addr_usize = addr_usize;
                         
                         // We injecteren page_size bytes (gesimuleerde data van de decompressie)
                         let mut page_data = vec![0u8; page_size];
