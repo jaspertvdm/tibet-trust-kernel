@@ -1,0 +1,78 @@
+# ═══════════════════════════════════════════════════════════════
+# Trust Kernel v1 — Standalone Gateway Deployment
+#
+# Model: Trust Kernel runs as a cluster-wide gateway.
+# All ingress traffic flows through Trust Kernel pods.
+#
+# Use case: Replace nginx ingress + WAF + fail2ban with one binary.
+#
+# Architecture:
+#   Internet → LoadBalancer → Trust Kernel DaemonSet
+#     → Voorproever (SNAFT + XDP + Seccomp)
+#     → PASS → forward to backend service
+#     → KILL → silent drop + TIBET incident
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: trust-kernel-gateway
+  namespace: trust-kernel
+  labels:
+    app: trust-kernel-gateway
+spec:
+  selector:
+    matchLabels:
+      app: trust-kernel-gateway
+  template:
+    metadata:
+      labels:
+        app: trust-kernel-gateway
+    spec:
+      # Run on every node for full coverage
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      hostNetwork: true  # Direct NIC access for XDP
+      containers:
+        - name: trust-kernel
+          image: humotica/trust-kernel:1.0.0
+          ports:
+            - containerPort: 4430
+              hostPort: 4430
+          env:
+            - name: TRUST_KERNEL_PROFILE
+              value: "paranoid"
+            - name: TRUST_KERNEL_MODE
+              value: "gateway"
+            - name: TRUST_KERNEL_XDP_ENABLED
+              value: "true"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          securityContext:
+            # XDP needs NET_ADMIN for eBPF attachment
+            capabilities:
+              add: ["NET_ADMIN", "BPF"]
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+
+---
+# ── SPIFFE ClusterSPIFFEID for Trust Kernel workloads ──
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: trust-kernel-identity
+spec:
+  spiffeIDTemplate: "spiffe://humotica.com/trust-kernel/{{ .PodMeta.Namespace }}/{{ .PodMeta.Name }}"
+  podSelector:
+    matchLabels:
+      trust-kernel.humotica.com/enabled: "true"
+  namespaceSelector:
+    matchLabels:
+      trust-kernel.humotica.com/enabled: "true"

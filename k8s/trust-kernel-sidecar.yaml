@@ -1,0 +1,207 @@
+# ═══════════════════════════════════════════════════════════════
+# Trust Kernel v1 — Kubernetes Sidecar Deployment
+#
+# Model: Trust Kernel runs as sidecar next to every application pod.
+# All traffic flows through the Trust Kernel before reaching the app.
+#
+# Architecture:
+#   ┌─────────────────────────────────────────────┐
+#   │  Pod                                        │
+#   │  ┌───────────────┐  ┌───────────────────┐  │
+#   │  │ trust-kernel   │  │ your-app          │  │
+#   │  │ (sidecar)      │→→│ (main container)  │  │
+#   │  │ :4430 MUX      │  │ :8080 app         │  │
+#   │  │ :4431 health   │  │                   │  │
+#   │  └───────────────┘  └───────────────────┘  │
+#   │                                             │
+#   │  ┌───────────────┐                          │
+#   │  │ spiffe-agent   │  ← SPIFFE identity      │
+#   │  │ (init/sidecar) │                          │
+#   │  └───────────────┘                          │
+#   └─────────────────────────────────────────────┘
+#
+# Traffic flow:
+#   Ingress → trust-kernel:4430 → Voorproever check
+#     → PASS → forward to your-app:8080
+#     → KILL → reject with TIBET incident token
+#
+# Resources: 64MB RAM, 0.1 CPU (minimal footprint)
+# ═══════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-with-trust-kernel
+  namespace: trust-kernel
+  labels:
+    app: example-app
+    trust-kernel.humotica.com/enabled: "true"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: example-app
+  template:
+    metadata:
+      labels:
+        app: example-app
+        trust-kernel.humotica.com/profile: balanced
+      annotations:
+        # SPIFFE identity for this workload
+        trust-kernel.humotica.com/spiffe-id: "spiffe://humotica.com/app/example-app"
+        # Trust Kernel profile
+        trust-kernel.humotica.com/profile: "balanced"
+        # Which intents this app is allowed to use
+        trust-kernel.humotica.com/allowed-intents: "http:get,http:post,db:query"
+    spec:
+      # SPIFFE CSI driver for identity
+      volumes:
+        - name: spiffe-workload
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        - name: trust-kernel-config
+          configMap:
+            name: trust-kernel-config
+        - name: trust-kernel-snapshots
+          emptyDir:
+            medium: Memory  # tmpfs — snapshots in RAM for speed
+            sizeLimit: 256Mi
+
+      containers:
+        # ── Trust Kernel Sidecar ──
+        - name: trust-kernel
+          image: humotica/trust-kernel:1.0.0
+          ports:
+            - containerPort: 4430
+              name: mux
+              protocol: TCP
+            - containerPort: 4431
+              name: health
+              protocol: TCP
+          env:
+            - name: TRUST_KERNEL_PROFILE
+              value: "balanced"
+            - name: TRUST_KERNEL_BACKEND
+              value: "localhost:8080"
+            - name: TRUST_KERNEL_SPIFFE_SOCKET
+              value: "unix:///run/spiffe/agent.sock"
+            - name: TRUST_KERNEL_SNAPSHOT_DIR
+              value: "/snapshots"
+            # Pod identity for TIBET tokens
+            - name: TRUST_KERNEL_AINT_DOMAIN
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "50m"
+            limits:
+              memory: "64Mi"
+              cpu: "200m"
+          volumeMounts:
+            - name: spiffe-workload
+              mountPath: /run/spiffe
+              readOnly: true
+            - name: trust-kernel-config
+              mountPath: /etc/trust-kernel
+              readOnly: true
+            - name: trust-kernel-snapshots
+              mountPath: /snapshots
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 4431
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 4431
+            initialDelaySeconds: 1
+            periodSeconds: 3
+          # Security context: minimal privileges
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+        # ── Application Container ──
+        - name: app
+          image: your-org/your-app:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          # App only listens on localhost — all external traffic via Trust Kernel
+          env:
+            - name: APP_LISTEN_ADDR
+              value: "127.0.0.1:8080"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+
+---
+# ── Service: exposes Trust Kernel port, not app port ──
+apiVersion: v1
+kind: Service
+metadata:
+  name: example-app
+  namespace: trust-kernel
+spec:
+  selector:
+    app: example-app
+  ports:
+    - name: mux
+      port: 443
+      targetPort: 4430
+      protocol: TCP
+  type: ClusterIP
+
+---
+# ── ConfigMap: Trust Kernel profile ──
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trust-kernel-config
+  namespace: trust-kernel
+data:
+  trust-kernel.toml: |
+    [profile.balanced]
+    voorproever_dryrun = true
+    jis_signing_per_action = true
+    zstd_snap_per_change = false
+    memory_zerofill = "on_exit"
+    tibet_token_granularity = "per_session"
+    fira_scoring = "live"
+
+    [watchdog]
+    timeout_ms = 100
+    heartbeat_interval_ms = 25
+    max_missed_heartbeats = 5
+
+    [bus]
+    shared_memory_bytes = 8388608
+    max_payload_bytes = 2097152
+
+    [upip]
+    chunk_size = 2097152
+    pressure_threshold_pct = 80.0
+    max_paged_chunks = 64
+
+---
+# ── Namespace ──
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: trust-kernel
+  labels:
+    trust-kernel.humotica.com/enabled: "true"

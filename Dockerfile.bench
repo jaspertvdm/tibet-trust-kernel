@@ -1,0 +1,21 @@
+# ═══════════════════════════════════════════════════════════════
+# Trust Kernel v1 — Benchmark Container
+#
+# Runs all benchmarks inside container to measure overhead.
+# Compare: bare metal vs Docker vs Docker+cgroups vs Docker+seccomp
+# ═══════════════════════════════════════════════════════════════
+
+FROM rust:1.77-slim-bookworm
+
+WORKDIR /bench
+
+# Copy source
+COPY Cargo.toml ./
+COPY src/ src/
+COPY benches/ benches/
+
+# Build all benchmarks in release mode
+RUN cargo build --release --benches 2>/dev/null; exit 0
+
+# Default: run the integration benchmark
+CMD ["cargo", "bench", "--bench", "container_bench", "--", "--nocapture"]

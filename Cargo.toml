@@ -1,0 +1,80 @@
+[package]
+name = "tibet-trust-kernel"
+version = "1.0.0-alpha"
+edition = "2021"
+description = "Dual-kernel zero-trust sandbox — Voorproever + Archivaris + UPIP + RAM RAID-0, cryptographic proof of every execution"
+license = "MIT"
+authors = ["Jasper van de Meent <jasper@humotica.com>", "Root AI <root_idd@humotica.nl>"]
+keywords = ["trust-kernel", "microvm", "sandbox", "security", "tibet"]
+categories = ["command-line-utilities", "development-tools"]
+repository = "https://github.com/humotica/trust-kernel"
+readme = "README.md"
+publish = false  # Niet publiceren — eerst laptop-testen!
+
+[package.metadata.docs.rs]
+features = ["kvm"]
+
+# NOTE: The `kvm` feature enables real kernel isolation via Ignition
+# (https://lttle.cloud / https://github.com/nicholasgasior/ignition)
+# Ignition is not yet on crates.io — use path/git dependency when building with KVM:
+#   ignition = { git = "https://github.com/nicholasgasior/ignition" }
+
+[features]
+default = ["simulation"]
+simulation = []                    # Simulated KVM — for testing without hardware
+kvm = []                           # Real Ignition KVM — requires /dev/kvm + ignition crate
+
+[dependencies]
+userfaultfd = "0.8.1"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Real KVM backend — when ignition is published to crates.io:
+# ignition = { version = "0.1", optional = true }
+
+[[bench]]
+name = "airlock_bench"
+harness = false
+
+[[bench]]
+name = "profile_bench"
+harness = false
+
+[[bench]]
+name = "roi_bench"
+harness = false
+
+[[bench]]
+name = "portmux_bench"
+harness = false
+
+[[bench]]
+name = "xdp_bench"
+harness = false
+
+[[bench]]
+name = "seccomp_zandbak_bench"
+harness = false
+
+[[bench]]
+name = "snapshot_bench"
+harness = false
+
+[[bench]]
+name = "upip_pager_bench"
+harness = false
+
+[[bench]]
+name = "vmm_inject_bench"
+harness = false
+
+[[bench]]
+name = "container_bench"
+harness = false
+
+[[bench]]
+name = "ram_raid_bench"
+harness = false
