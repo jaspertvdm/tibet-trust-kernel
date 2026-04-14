@@ -5,6 +5,7 @@ use crate::bus::{BusPayload, BusResult, VirtualBus};
 use crate::config::TrustKernelConfig;
 use crate::tibet_token::TibetProvenance;
 use crate::mux::TibetMuxFrame;
+use crate::bifurcation::{AirlockBifurcation, BifurcationResult, ClearanceLevel, JisClaim, EncryptedBlock};
 
 /// Kernel B — De Archivaris ("De Schone Kluis")
 ///
@@ -17,6 +18,10 @@ use crate::mux::TibetMuxFrame;
 /// 3. Execute the verified action
 /// 4. Append-only storage (no overwrites, no deletes)
 /// 5. Mint the definitive TIBET provenance token
+/// 6. **Airlock Bifurcatie**: encrypt-on-write, decrypt-on-read
+///    Data at rest is ALTIJD encrypted. Zonder JIS claim = dood materiaal.
+///    Re-encrypt-on-deny: als JIS geen lezen/bewerken toestaat,
+///    gaat data terug naar encrypted state ("omgekeerde ransomware").
 ///
 /// The Archivaris is the ONLY component that mints final TIBET tokens.
 /// The Voorproever can generate incident tokens (kills), but success tokens
@@ -68,6 +73,10 @@ pub struct Archivaris {
     bus: Arc<VirtualBus>,
     /// Append-only archive log
     archive: Vec<ArchiveEntry>,
+    /// Airlock Bifurcatie engine — encrypt-by-default
+    bifurcation: AirlockBifurcation,
+    /// Encrypted block vault — data at rest (altijd versleuteld)
+    vault: Vec<EncryptedBlock>,
     /// Boot time for relative timestamps
     boot_time: Instant,
 }
@@ -78,6 +87,8 @@ impl Archivaris {
             config,
             bus,
             archive: Vec::new(),
+            bifurcation: AirlockBifurcation::new(),
+            vault: Vec::new(),
             boot_time: Instant::now(),
         }
     }
@@ -210,4 +221,175 @@ impl Archivaris {
     pub fn archive_len(&self) -> usize {
         self.archive.len()
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // Airlock Bifurcatie — Encrypt-by-Default
+    // ═══════════════════════════════════════════════════════════
+
+    /// Store data in de vault (encrypt-on-write).
+    ///
+    /// Data gaat NOOIT onversleuteld de disk op.
+    /// Dit is het "ransomware" moment — maar dan by design.
+    pub fn vault_store(
+        &mut self,
+        data: &[u8],
+        clearance: ClearanceLevel,
+        stored_by: &str,
+    ) -> VaultStoreResult {
+        let block_index = self.vault.len();
+
+        match self.bifurcation.seal(data, block_index, clearance, stored_by) {
+            BifurcationResult::Sealed { block, encrypt_us, key_derive_us } => {
+                self.vault.push(block);
+
+                // Append-only log
+                self.archive.push(ArchiveEntry {
+                    seq: self.archive.len() as u64,
+                    intent: format!("vault_store_block_{}", block_index),
+                    from_aint: stored_by.to_string(),
+                    result: format!(
+                        "Sealed: block={} clearance={} encrypt={}us",
+                        block_index,
+                        clearance.as_str(),
+                        encrypt_us
+                    ),
+                    tibet_token_type: "VAULT_SEAL".to_string(),
+                    timestamp_ns: self.boot_time.elapsed().as_nanos() as u64,
+                });
+
+                VaultStoreResult::Sealed {
+                    block_index,
+                    encrypt_us,
+                    key_derive_us,
+                }
+            }
+            _ => VaultStoreResult::Failed {
+                reason: "Bifurcation seal failed".to_string(),
+            },
+        }
+    }
+
+    /// Retrieve data uit de vault (decrypt-on-read).
+    ///
+    /// Dit is het bifurcatiepunt:
+    ///   JIS claim geldig + clearance OK → decrypt → levende data
+    ///   JIS claim ongeldig of clearance te laag → GEWEIGERD → dood materiaal
+    pub fn vault_retrieve(
+        &mut self,
+        block_index: usize,
+        claim: &JisClaim,
+    ) -> VaultRetrieveResult {
+        let block = match self.vault.get(block_index) {
+            Some(b) => b,
+            None => return VaultRetrieveResult::NotFound { block_index },
+        };
+
+        match self.bifurcation.open(block, claim) {
+            BifurcationResult::Opened { plaintext, decrypt_us, key_derive_us, opened_by } => {
+                // Log de opening (TIBET audit trail)
+                self.archive.push(ArchiveEntry {
+                    seq: self.archive.len() as u64,
+                    intent: format!("vault_retrieve_block_{}", block_index),
+                    from_aint: opened_by.clone(),
+                    result: format!(
+                        "Opened: block={} by={} clearance={} decrypt={}us",
+                        block_index,
+                        opened_by,
+                        claim.clearance.as_str(),
+                        decrypt_us
+                    ),
+                    tibet_token_type: "VAULT_OPEN".to_string(),
+                    timestamp_ns: self.boot_time.elapsed().as_nanos() as u64,
+                });
+
+                VaultRetrieveResult::Opened {
+                    plaintext,
+                    decrypt_us,
+                    key_derive_us,
+                }
+            }
+            BifurcationResult::AccessDenied { required, presented, identity } => {
+                // Log de weigering (TIBET audit trail — belangrijk!)
+                self.archive.push(ArchiveEntry {
+                    seq: self.archive.len() as u64,
+                    intent: format!("vault_retrieve_DENIED_block_{}", block_index),
+                    from_aint: identity.clone(),
+                    result: format!(
+                        "ACCESS DENIED: block={} required={} presented={} identity={}",
+                        block_index,
+                        required.as_str(),
+                        presented.as_str(),
+                        identity
+                    ),
+                    tibet_token_type: "VAULT_DENIED".to_string(),
+                    timestamp_ns: self.boot_time.elapsed().as_nanos() as u64,
+                });
+
+                VaultRetrieveResult::AccessDenied {
+                    required,
+                    presented,
+                    identity,
+                }
+            }
+            BifurcationResult::ClaimInvalid { reason } => {
+                VaultRetrieveResult::ClaimInvalid { reason }
+            }
+            BifurcationResult::IntegrityFailed { .. } => {
+                VaultRetrieveResult::IntegrityFailed { block_index }
+            }
+            _ => VaultRetrieveResult::Failed {
+                reason: "Unexpected bifurcation result".to_string(),
+            },
+        }
+    }
+
+    /// Vault grootte (aantal encrypted blocks).
+    pub fn vault_len(&self) -> usize {
+        self.vault.len()
+    }
+
+    /// Bifurcatie statistieken.
+    pub fn bifurcation_stats(&self) -> &crate::bifurcation::BifurcationStats {
+        self.bifurcation.stats()
+    }
+}
+
+/// Resultaat van vault_store (encrypt-on-write).
+#[derive(Debug)]
+pub enum VaultStoreResult {
+    Sealed {
+        block_index: usize,
+        encrypt_us: u64,
+        key_derive_us: u64,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+/// Resultaat van vault_retrieve (decrypt-on-read).
+#[derive(Debug)]
+pub enum VaultRetrieveResult {
+    Opened {
+        plaintext: Vec<u8>,
+        decrypt_us: u64,
+        key_derive_us: u64,
+    },
+    AccessDenied {
+        required: ClearanceLevel,
+        presented: ClearanceLevel,
+        identity: String,
+    },
+    ClaimInvalid {
+        reason: String,
+    },
+    IntegrityFailed {
+        block_index: usize,
+    },
+    NotFound {
+        block_index: usize,
+    },
+    Failed {
+        reason: String,
+    },
 }

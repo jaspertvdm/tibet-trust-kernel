@@ -16,6 +16,7 @@ mod recovery;
 mod git_store;
 mod upip_pager;
 mod ram_raid;
+mod bifurcation;
 
 use std::sync::Arc;
 use std::time::Instant;

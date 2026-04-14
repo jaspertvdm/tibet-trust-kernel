@@ -32,6 +32,13 @@ serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Airlock Bifurcatie — echte crypto
+aes-gcm = "0.10"           # AES-256-GCM via AES-NI (core::arch::x86_64::_mm_aesenc_si128)
+x25519-dalek = { version = "2", features = ["static_secrets"] }  # X25519 key agreement
+sha2 = "0.10"               # SHA-256
+hkdf = "0.12"               # HKDF-SHA256 per-block key derivation
+rand = "0.8"                # OsRng voor nonces en ephemeral keys
+
 # Real KVM backend — when ignition is published to crates.io:
 # ignition = { version = "0.1", optional = true }
 
@@ -77,4 +84,8 @@ harness = false
 
 [[bench]]
 name = "ram_raid_bench"
+harness = false
+
+[[bench]]
+name = "bifurcation_bench"
 harness = false
