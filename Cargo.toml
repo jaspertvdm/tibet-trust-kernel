@@ -43,6 +43,10 @@ rayon = "1.10"              # Multi-core parallel sealing/opening
 # Real KVM backend — when ignition is published to crates.io:
 # ignition = { version = "0.1", optional = true }
 
+[[bin]]
+name = "tibet-bench"
+path = "src/bin/tibet_bench.rs"
+
 [[bench]]
 name = "airlock_bench"
 harness = false
