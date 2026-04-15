@@ -2,7 +2,7 @@ use std::time::Instant;
 use std::fs;
 use std::io::Write;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Serialize, Deserialize};
 use rayon::prelude::*;
 
@@ -1059,7 +1059,7 @@ impl AirlockBifurcation {
         let ephemeral_pub = session.ephemeral_pub;
         let encrypted_by = encrypted_by.to_string();
         let boot_time = self.boot_time;
-        let blocks_sealed = AtomicU64::new(0);
+        let blocks_sealed = AtomicUsize::new(0);
 
         // Von Braun drempel: onder 16KB is rayon overhead groter dan de winst.
         // In dat geval single-thread, tenzij er genoeg blocks zijn om het waard te maken.
@@ -1116,7 +1116,7 @@ impl AirlockBifurcation {
 
         let total_us = t0.elapsed().as_micros() as u64;
         let total_bytes: usize = plaintexts.iter().map(|p| p.len()).sum();
-        let sealed = blocks_sealed.load(Ordering::Relaxed);
+        let sealed = blocks_sealed.load(Ordering::Relaxed) as u64;
         let count = blocks.len().max(1);
 
         // Update stats
@@ -1153,7 +1153,7 @@ impl AirlockBifurcation {
         claim: &JisClaim,
     ) -> BatchOpenResult {
         let t0 = Instant::now();
-        let denied = AtomicU64::new(0);
+        let denied = AtomicUsize::new(0);
         let system_secret = self.system_secret;
 
         if claim.identity.is_empty() || claim.ed25519_pub.len() != ED25519_PUB_SIZE * 2 {
@@ -1225,11 +1225,11 @@ impl AirlockBifurcation {
 
         // Update stats
         self.stats.blocks_opened += plaintexts.len() as u64;
-        self.stats.access_denied += denied.load(Ordering::Relaxed);
+        self.stats.access_denied += denied.load(Ordering::Relaxed) as u64;
 
         BatchOpenResult {
             plaintexts,
-            denied: denied.load(Ordering::Relaxed),
+            denied: denied.load(Ordering::Relaxed) as u64,
             total_us,
             per_block_us: total_us / count as u64,
             throughput_mbs: (total_bytes as f64) / (total_us.max(1) as f64 / 1_000_000.0) / (1024.0 * 1024.0),
@@ -1296,7 +1296,7 @@ pub fn parallel_seal(
     let system_pub = PublicKey::from(&system_static);
     let system_pub_bytes = system_pub.to_bytes();
     let encrypted_by = encrypted_by.to_string();
-    let blocks_sealed = AtomicU64::new(0);
+    let blocks_sealed = AtomicUsize::new(0);
 
     // Rayon parallel iterator — elke core pakt een block
     let blocks: Vec<EncryptedBlock> = plaintexts
@@ -1373,7 +1373,7 @@ pub fn parallel_open(
     system_secret: &[u8; 32],
 ) -> BatchOpenResult {
     let t0 = Instant::now();
-    let denied = AtomicU64::new(0);
+    let denied = AtomicUsize::new(0);
 
     // Valideer claim eenmalig (niet per thread)
     if claim.identity.is_empty() || claim.ed25519_pub.len() != ED25519_PUB_SIZE * 2 {
@@ -1436,7 +1436,7 @@ pub fn parallel_open(
 
     BatchOpenResult {
         plaintexts,
-        denied: denied.load(Ordering::Relaxed),
+        denied: denied.load(Ordering::Relaxed) as u64,
         total_us,
         per_block_us: total_us / count as u64,
         throughput_mbs: (total_bytes as f64) / (total_us.max(1) as f64 / 1_000_000.0) / (1024.0 * 1024.0),

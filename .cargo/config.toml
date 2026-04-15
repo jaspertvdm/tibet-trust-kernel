@@ -1,0 +1,12 @@
+[target.mips-unknown-linux-musl]
+linker = "/tmp/mips-linux-muslsf-cross/bin/mips-linux-muslsf-gcc"
+rustflags = ["-C", "target-feature=+soft-float"]
+
+[target.mips-unknown-linux-gnu]
+linker = "mips-linux-gnu-gcc"
+
+[target.mipsel-unknown-linux-musl]
+linker = "mipsel-linux-gnu-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
