@@ -31,7 +31,7 @@ fn main() {
     print!("  RDSEED:   ");
     if rdseed_available() { println!("YES (true entropy)"); }
     else { println!("no"); }
-    print!("  AES-NI:   ");
+    print!("  AES HW:   ");
     #[cfg(target_arch = "x86_64")]
     {
         let ecx: u32;
@@ -42,11 +42,17 @@ fn main() {
                 options(nostack),
             );
         }
-        if (ecx >> 25) & 1 == 1 { println!("YES (hardware AES)"); }
+        if (ecx >> 25) & 1 == 1 { println!("YES (AES-NI)"); }
         else { println!("no (software AES)"); }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    { println!("n/a (niet x86_64)"); }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM Crypto Extensions zijn standaard op ARMv8+
+        // De aes-gcm crate detecteert dit automatisch via cpufeatures
+        println!("YES (ARM Crypto Extensions)");
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { println!("software (geen hardware detectie)"); }
     print!("  CAT L3:   ");
     match cat_l3_status() {
         CatL3Status::Active { ways_reserved, ways_total, .. } =>
@@ -245,13 +251,18 @@ fn main() {
             rdseed_ns, if fast { "FAST — used in cascade" } else { "SLOW — skipped in cascade" });
     }
 
-    if rdrand_available() {
+    // Nonce bench — altijd draaien, rdrand_nonce() kiest automatisch beste bron
+    {
         let t0 = Instant::now();
         for _ in 0..n { let _ = rdrand_nonce(); }
         let nonce_ns = (t0.elapsed().as_micros() * 1000) / n;
-        println!("  Nonce:    {} ns/nonce (auto-select: best available)", nonce_ns);
+        let source = if rdseed_available() { "RDSEED" }
+            else if rdrand_available() { "RDRAND" }
+            else { "OsRng" };
+        println!("  Nonce:    {} ns/nonce (via {})", nonce_ns, source);
     }
 
+    // OsRng baseline — altijd beschikbaar
     {
         let t0 = Instant::now();
         for _ in 0..n {
@@ -259,7 +270,7 @@ fn main() {
             rand::Rng::fill(&mut rand::rngs::OsRng, &mut nonce);
         }
         let osrng_ns = (t0.elapsed().as_micros() * 1000) / n;
-        println!("  OsRng:    {} ns/nonce (syscall fallback)", osrng_ns);
+        println!("  OsRng:    {} ns/nonce (kernel entropy)", osrng_ns);
     }
     println!();
 
@@ -267,8 +278,12 @@ fn main() {
     println!("  ═══════════════════════════════════════════════════════");
     println!("  TIBET Airlock Bifurcatie — Encrypt-by-Default");
     println!();
+    println!("  Platform:  {} / {}", std::env::consts::ARCH, std::env::consts::OS);
     println!("  Crypto:    AES-256-GCM + X25519 + HKDF-SHA256");
-    println!("  Nonces:    RDRAND hardware ({})", if rdrand_available() { "active" } else { "fallback" });
+    let nonce_src = if rdseed_available() { "RDSEED (true entropy)" }
+        else if rdrand_available() { "RDRAND (hardware PRNG)" }
+        else { "OsRng (kernel entropy)" };
+    println!("  Nonces:    {}", nonce_src);
     println!("  Best seal: {} us (session, 4KB)", session_per);
     println!("  Best open: {} us (cached, 4KB)", cached_per);
     println!();

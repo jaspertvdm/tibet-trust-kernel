@@ -15,11 +15,19 @@ use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use rand::rngs::OsRng;
 
 // ═══════════════════════════════════════════════════════════════
-// RDRAND — Hardware Random Number Generation
+// Hardware Entropy — Platform-Aware Nonce Generation
 //
-// Direct CPU instructie, geen syscall naar /dev/urandom.
-// Beschikbaar op: Intel Ivy Bridge+ (2012), AMD Zen+ (2018)
-// Detectie: cpuid flag "rdrand"
+// Cascade prioriteit:
+//   x86_64:  RDSEED (true entropy) → RDRAND (hw PRNG) → OsRng
+//   aarch64: ARM CSPRNG via OsRng (kernel getrandom)
+//   overig:  OsRng fallback
+//
+// Ondersteunde platforms:
+//   - x86_64: Intel Ivy Bridge+ (2012), AMD Zen+ (2018) — RDRAND/RDSEED
+//   - aarch64: ARMv8+ (smartphones, Apple Silicon, Graviton) — OsRng
+//   - Elke andere arch: OsRng fallback, altijd correct
+//
+// RDSEED timing check: bij init eenmalig gemeten, >5µs = skip in cascade
 // ═══════════════════════════════════════════════════════════════
 
 /// Check of RDRAND beschikbaar is op deze CPU.
