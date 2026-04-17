@@ -8,6 +8,10 @@ use serde::{Serialize, Deserialize};
 use libc::{c_void, mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE, sysconf, _SC_PAGESIZE};
 use userfaultfd::{Uffd, UffdBuilder, Event};
 
+// Cluster MUX — real network transport for RAM B
+use crate::cluster_mux::ClusterMuxClient;
+use crate::cluster_transport::{BlockStore, sha256_hex};
+
 /// Productie wrapper voor de RAM RAID Controller, gekoppeld aan de hardware MMU trap
 pub struct ActiveRamRaid {
     pub controller: Arc<Mutex<RamRaidController>>,
@@ -410,6 +414,12 @@ pub struct RamRaidController {
     bus_seq: AtomicU64,
     /// LRU eviction index (for finding coldest block)
     lru_clock: AtomicU64,
+    /// Cluster MUX client for real network transport to RAM B
+    mux_client: Option<Arc<ClusterMuxClient>>,
+    /// Tokio runtime handle for calling async transport from sync fault handler
+    runtime_handle: Option<tokio::runtime::Handle>,
+    /// Remote block store (for local-only testing without network)
+    local_block_store: Option<Arc<BlockStore>>,
 }
 
 impl RamRaidController {
@@ -449,7 +459,28 @@ impl RamRaidController {
             active: AtomicBool::new(true),
             bus_seq: AtomicU64::new(0),
             lru_clock: AtomicU64::new(0),
+            mux_client: None,
+            runtime_handle: None,
+            local_block_store: None,
         }
+    }
+
+    /// Attach a ClusterMuxClient for real network transport to RAM B.
+    ///
+    /// The tokio runtime handle is needed because the fault handler runs
+    /// in a plain thread (not tokio), so we use `handle.block_on()` to
+    /// call async transport methods.
+    pub fn with_mux_transport(mut self, client: Arc<ClusterMuxClient>, handle: tokio::runtime::Handle) -> Self {
+        self.mux_client = Some(client);
+        self.runtime_handle = Some(handle);
+        self
+    }
+
+    /// Attach a local BlockStore for testing without network.
+    /// This simulates RAM B as a separate in-memory store.
+    pub fn with_local_block_store(mut self, store: Arc<BlockStore>) -> Self {
+        self.local_block_store = Some(store);
+        self
     }
 
     /// TIBET-Store MMU: Transformeert deze logische RAID-0 controller in een echte hardware MMU-trap.
@@ -504,6 +535,15 @@ impl RamRaidController {
         let u_clone = uffd.clone();
 
         // 3. De Archivaris / Fault Handler Thread
+        //
+        // Dit is het hart van de transparante geheugen-virtualisatie:
+        //   - userfaultfd vangt page faults op (hardware MMU trap)
+        //   - handle_fault_production() fetcht data van RAM B via ClusterMux
+        //   - uffd.copy() injecteert de echte data in het fysieke geheugen
+        //   - De app-thread wordt hervat — merkt niets van het hele process
+        //
+        // De fault handler thread is een gewone thread (geen tokio), dus
+        // block_on_safe() kan veilig een temp runtime maken voor async MUX calls.
         let addr_usize = addr as usize;
         let fault_thread = thread::spawn(move || {
             loop {
@@ -516,25 +556,69 @@ impl RamRaidController {
                     Ok(Some(Event::Pagefault { addr: fault_addr, .. })) => {
                         let offset = fault_addr as usize - addr_usize;
                         let mut lock = c_clone.lock().unwrap();
-                        
-                        // Hier zit de magische koppeling: We sturen de page fault naar onze RAM RAID logica!
-                        let _fault_result = lock.handle_fault(offset);
-                        
-                        // Nu lossen we de fysieke injectie op:
-                        let fault_addr_aligned = (fault_addr as usize / page_size) * page_size;
-                        let _addr_usize = addr_usize;
-                        
-                        // We injecteren page_size bytes (gesimuleerde data van de decompressie)
-                        let mut page_data = vec![0u8; page_size];
-                        
-                        // Vul de page met wat TIBET metadata ter verificatie van de injectie
-                        let message = format!("◈ TIBET-STORE INJECTED BLOCK OFFSET {:#x} ◈", offset);
-                        let fill_len = message.len().min(page_size);
-                        page_data[..fill_len].copy_from_slice(message.as_bytes());
 
-                        let _ = unsafe {
-                            u_clone.copy(page_data.as_ptr() as *const _, fault_addr_aligned as *mut _, page_size, true)
+                        // THE MAGIC: page fault → RAM RAID → MUX fetch → uffd.copy()
+                        let (fault_result, block_data) = lock.handle_fault_production(offset);
+
+                        // Determine injection address and size
+                        let fault_addr_aligned = (fault_addr as usize / page_size) * page_size;
+
+                        // Build the page data for injection
+                        let page_data = if !block_data.is_empty() {
+                            // Real data from RAM B (or local store)
+                            // Slice to page_size if block is larger than one page
+                            let page_offset = fault_addr_aligned - addr_usize;
+                            let block_idx = lock.block_index_for_addr(page_offset);
+                            let block_start = block_idx * lock.config.block_size;
+                            let offset_in_block = page_offset - block_start;
+
+                            if offset_in_block < block_data.len() {
+                                let end = (offset_in_block + page_size).min(block_data.len());
+                                let mut page = vec![0u8; page_size];
+                                let copy_len = end - offset_in_block;
+                                page[..copy_len].copy_from_slice(&block_data[offset_in_block..end]);
+                                page
+                            } else {
+                                vec![0u8; page_size]
+                            }
+                        } else {
+                            // Zero page or error — inject zeros
+                            vec![0u8; page_size]
                         };
+
+                        // Drop the lock BEFORE uffd.copy() to avoid holding it during kernel call
+                        let block_size = lock.config.block_size;
+                        drop(lock);
+
+                        // Inject into physical memory — app thread resumes after this
+                        let _ = unsafe {
+                            u_clone.copy(
+                                page_data.as_ptr() as *const _,
+                                fault_addr_aligned as *mut _,
+                                page_size,
+                                true,
+                            )
+                        };
+
+                        match &fault_result {
+                            FaultResult::RestoredRemote { block_index, fetch_us, .. } => {
+                                println!("◈ [MMU] Block {} fetched from RAM B ({}µs) → injected at {:#x}",
+                                         block_index, fetch_us, fault_addr_aligned);
+                            }
+                            FaultResult::RestoredLocal { block_index, .. } => {
+                                println!("◈ [MMU] Block {} restored local → injected at {:#x}",
+                                         block_index, fault_addr_aligned);
+                            }
+                            FaultResult::ZeroFilled { block_index, .. } => {
+                                println!("◈ [MMU] Block {} zero-fill → injected at {:#x}",
+                                         block_index, fault_addr_aligned);
+                            }
+                            FaultResult::Failed { block_index, reason } => {
+                                eprintln!("◈ [MMU] Block {} FAILED: {} — injected zeros at {:#x}",
+                                          block_index, reason, fault_addr_aligned);
+                            }
+                            _ => {}
+                        }
                     }
                     Ok(None) | Err(_) => {
                         thread::sleep(std::time::Duration::from_millis(1));
@@ -637,6 +721,133 @@ impl RamRaidController {
         self.restore_block(block_idx, now_ns)
     }
 
+    /// Handle a page fault in production mode — returns the actual data to inject.
+    ///
+    /// Unlike `handle_fault()` (simulation), this returns `(FaultResult, Vec<u8>)`
+    /// where the Vec is the actual block data for uffd.copy() injection.
+    /// Called from the userfaultfd fault handler thread.
+    pub fn handle_fault_production(&mut self, fault_addr: usize) -> (FaultResult, Vec<u8>) {
+        let block_idx = self.block_index_for_addr(fault_addr);
+        if block_idx >= self.blocks.len() {
+            return (FaultResult::Failed {
+                block_index: block_idx,
+                reason: format!("Block index {} out of range", block_idx),
+            }, Vec::new());
+        }
+
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+        // Evict if needed
+        let need_eviction = self.resident_count.load(Ordering::Acquire)
+            >= self.config.max_resident_blocks as u64;
+        if need_eviction {
+            let _ = self.evict_coldest();
+        }
+
+        self.restore_block_with_data(block_idx, now_ns)
+    }
+
+    /// Restore a block and return both the result and the actual data.
+    fn restore_block_with_data(&mut self, block_idx: usize, now_ns: u64) -> (FaultResult, Vec<u8>) {
+        let (result, data) = self.restore_block_inner(block_idx, now_ns);
+        (result, data)
+    }
+
+    /// Inner restore that returns data for production injection.
+    fn restore_block_inner(&mut self, block_idx: usize, now_ns: u64) -> (FaultResult, Vec<u8>) {
+        let t0 = Instant::now();
+        let block = &self.blocks[block_idx];
+        let block_size = block.size;
+
+        match &block.location {
+            BlockLocation::Resident => {
+                (FaultResult::AlreadyResident { block_index: block_idx }, Vec::new())
+            }
+
+            BlockLocation::Virgin => {
+                let inject_us = t0.elapsed().as_micros() as u64;
+                self.blocks[block_idx].location = BlockLocation::Resident;
+                self.blocks[block_idx].access_count = 1;
+                self.blocks[block_idx].last_access_ns = now_ns;
+                self.resident_count.fetch_add(1, Ordering::AcqRel);
+                self.zero_pages_served.fetch_add(1, Ordering::Relaxed);
+                self.faults_handled.fetch_add(1, Ordering::Relaxed);
+                (FaultResult::ZeroFilled { block_index: block_idx, inject_us }, vec![0u8; block_size])
+            }
+
+            BlockLocation::LocalStore { .. } => {
+                // TODO: In real production, read .tza from disk + decompress
+                // For now: return simulated data (same as simulation path)
+                let data = vec![0u8; block_size];
+                let result = self.restore_block(block_idx, now_ns);
+                (result, data)
+            }
+
+            BlockLocation::RemoteKernel { .. } => {
+                let content_hash = block.content_hash.clone();
+                let bus_seq = self.bus_seq.fetch_add(1, Ordering::SeqCst);
+
+                // Fetch real data from remote via MUX
+                let fetch_t0 = Instant::now();
+                let fetched_data = if let Some(client) = &self.mux_client {
+                    let c = client.clone();
+                    let ch = content_hash.clone();
+                    match block_on_safe(c.fetch_block(block_idx, ch.as_deref(), bus_seq)) {
+                        Ok((data, _rtt)) => data,
+                        Err(e) => {
+                            return (FaultResult::Failed {
+                                block_index: block_idx,
+                                reason: format!("Remote fetch failed: {}", e),
+                            }, Vec::new());
+                        }
+                    }
+                } else {
+                    // No client — return zeros
+                    vec![0u8; block_size]
+                };
+                let fetch_us = fetch_t0.elapsed().as_micros() as u64;
+
+                // Verify integrity
+                if let Some(ref expected) = content_hash {
+                    let computed = sha256_hex(&fetched_data);
+                    if computed != *expected {
+                        return (FaultResult::Failed {
+                            block_index: block_idx,
+                            reason: format!("Integrity: expected {}, got {}", expected, computed),
+                        }, Vec::new());
+                    }
+                }
+
+                let total_us = t0.elapsed().as_micros() as u64;
+
+                self.blocks[block_idx].location = BlockLocation::Resident;
+                self.blocks[block_idx].access_count += 1;
+                self.blocks[block_idx].last_access_ns = now_ns;
+                self.blocks[block_idx].dirty = false;
+                self.resident_count.fetch_add(1, Ordering::AcqRel);
+                self.bytes_decompressed.fetch_add(fetched_data.len() as u64, Ordering::Relaxed);
+                self.remote_transfers.fetch_add(1, Ordering::Relaxed);
+                self.faults_handled.fetch_add(1, Ordering::Relaxed);
+
+                (FaultResult::RestoredRemote {
+                    block_index: block_idx,
+                    fetch_us,
+                    decompress_us: 0,
+                    verify_us: 0,
+                    inject_us: 0,
+                    total_us,
+                }, fetched_data)
+            }
+
+            BlockLocation::Fetching => {
+                (FaultResult::Failed {
+                    block_index: block_idx,
+                    reason: "Already fetching".to_string(),
+                }, Vec::new())
+            }
+        }
+    }
+
     /// Restore a single block to resident state.
     fn restore_block(&mut self, block_idx: usize, now_ns: u64) -> FaultResult {
         let t0 = Instant::now();
@@ -709,31 +920,76 @@ impl RamRaidController {
                 }
             }
 
-            BlockLocation::RemoteKernel { kernel_id, endpoint, .. } => {
+            BlockLocation::RemoteKernel { kernel_id, endpoint, fork_token_id } => {
                 // Restore from remote kernel — the RAID-0 magic
                 let block_size = block.size;
                 let _kernel_id = kernel_id.clone();
                 let _endpoint = endpoint.clone();
+                let _fork_token_id = fork_token_id.clone();
+                let content_hash = block.content_hash.clone();
+                let bus_seq = self.bus_seq.fetch_add(1, Ordering::SeqCst);
 
-                // Step 1: Fetch via intent mux
+                // Step 1: Fetch via ClusterMux (real network) or BlockStore (local test)
                 let fetch_t0 = Instant::now();
-                // In production: TCP/QUIC to remote kernel, request Fork Token
-                // Simulated: ~200µs network RTT + transfer time
-                let transfer_ns = 200_000 + (block_size as u64 * 8); // 200µs + ~1Gbps
-                let fetch_us = (transfer_ns / 1000).max(fetch_t0.elapsed().as_micros() as u64);
+                let fetched_data = if let Some(client) = &self.mux_client {
+                    // REAL TRANSPORT: Fetch block from remote kernel via persistent MUX
+                    let c = client.clone();
+                    let ch = content_hash.clone();
+                    match block_on_safe(c.fetch_block(
+                        block_idx,
+                        ch.as_deref(),
+                        bus_seq,
+                    )) {
+                        Ok((data, _rtt_us)) => Some(data),
+                        Err(e) => {
+                            return FaultResult::Failed {
+                                block_index: block_idx,
+                                reason: format!("Remote fetch failed: {}", e),
+                            };
+                        }
+                    }
+                } else if let Some(store) = &self.local_block_store {
+                    // LOCAL TEST: Fetch from in-memory BlockStore (simulates RAM B)
+                    match handle_block_on_local(store, block_idx) {
+                        Some(data) => Some(data),
+                        None => {
+                            return FaultResult::Failed {
+                                block_index: block_idx,
+                                reason: format!("Block {} not found in local block store", block_idx),
+                            };
+                        }
+                    }
+                } else {
+                    // SIMULATION fallback (no transport attached)
+                    None
+                };
+                let fetch_us = fetch_t0.elapsed().as_micros() as u64;
 
-                // Step 2: Verify
+                // Step 2: Verify SHA-256 integrity
                 let verify_t0 = Instant::now();
+                if let Some(ref data) = fetched_data {
+                    if let Some(ref expected_hash) = content_hash {
+                        let computed = sha256_hex(data);
+                        if computed != *expected_hash {
+                            return FaultResult::Failed {
+                                block_index: block_idx,
+                                reason: format!(
+                                    "Integrity check failed: expected {}, got {}",
+                                    expected_hash, computed
+                                ),
+                            };
+                        }
+                    }
+                }
                 let verify_us = verify_t0.elapsed().as_micros() as u64;
 
-                // Step 3: Decompress
+                // Step 3: Decompress (data from network is already decompressed in current impl)
                 let decompress_t0 = Instant::now();
-                let compressed_size = block_size / 4;
-                let _decompress_ns = simulate_zstd_decompress(compressed_size, block_size);
                 let decompress_us = decompress_t0.elapsed().as_micros() as u64;
 
-                // Step 4: Inject
+                // Step 4: Inject via uffd.copy() (in production)
                 let inject_t0 = Instant::now();
+                // In production: uffd.copy(data_ptr, fault_addr, block_size, true)
                 let inject_us = inject_t0.elapsed().as_micros() as u64;
 
                 let total_us = t0.elapsed().as_micros() as u64;
@@ -743,7 +999,10 @@ impl RamRaidController {
                 self.blocks[block_idx].last_access_ns = now_ns;
                 self.blocks[block_idx].dirty = false;
                 self.resident_count.fetch_add(1, Ordering::AcqRel);
-                self.bytes_decompressed.fetch_add(block_size as u64, Ordering::Relaxed);
+                self.bytes_decompressed.fetch_add(
+                    fetched_data.as_ref().map(|d| d.len() as u64).unwrap_or(block_size as u64),
+                    Ordering::Relaxed,
+                );
                 self.remote_transfers.fetch_add(1, Ordering::Relaxed);
                 self.faults_handled.fetch_add(1, Ordering::Relaxed);
 
@@ -849,11 +1108,39 @@ impl RamRaidController {
         let evict_to_remote = has_remote && stripe == RaidStripe::RamB;
 
         if evict_to_remote {
-            // Send to remote kernel (RAM B)
+            // Send to remote kernel (RAM B) via ClusterMux
             let transfer_t0 = Instant::now();
-            // In production: TCP/QUIC transfer of compressed .tza block
-            let transfer_us = transfer_t0.elapsed().as_micros() as u64;
 
+            // Compute real SHA-256 hash of the data we're sending
+            let real_hash = sha256_hex(&simulated_data);
+
+            if let Some(client) = &self.mux_client {
+                // REAL TRANSPORT: Store block on remote kernel via persistent MUX
+                let c = client.clone();
+                let d = simulated_data.clone();
+                let h = real_hash.clone();
+                let s = seal.clone();
+                match block_on_safe(c.store_block(idx, &d, &h, &s, block_size, seq)) {
+                    Ok(_store_us) => { /* success */ }
+                    Err(e) => {
+                        return EvictionResult::Failed {
+                            block_index: idx,
+                            reason: format!("Remote store failed: {}", e),
+                        };
+                    }
+                }
+            } else if let Some(store) = &self.local_block_store {
+                // LOCAL TEST: Store in in-memory BlockStore (simulates RAM B)
+                let from_aint = self.config.from_aint.clone();
+                let s = store.clone();
+                let data = simulated_data.clone();
+                let h = real_hash.clone();
+                let se = seal.clone();
+                block_on_safe(s.store(idx, data, h, se, block_size, from_aint, seq));
+            }
+            // else: simulation mode — no actual transfer
+
+            let transfer_us = transfer_t0.elapsed().as_micros() as u64;
             let total_us = t0.elapsed().as_micros() as u64;
 
             let kernel_id = self.config.ram_b_kernel_id.clone().unwrap_or_default();
@@ -864,7 +1151,7 @@ impl RamRaidController {
                 endpoint,
                 fork_token_id: format!("raid_fork_remote_{}", seq),
             };
-            self.blocks[idx].content_hash = Some(content_hash);
+            self.blocks[idx].content_hash = Some(real_hash);
             self.blocks[idx].seal = Some(seal);
             self.blocks[idx].dirty = false;
             self.resident_count.fetch_sub(1, Ordering::AcqRel);
@@ -980,6 +1267,186 @@ impl RamRaidController {
         self.handle_fault(fault_addr)
     }
 
+    /// Batch read: read multiple blocks, batching remote fetches via pipelined MUX.
+    ///
+    /// Instead of fetch-one-by-one (N round trips), this:
+    ///   1. Partitions blocks into resident / local / remote
+    ///   2. Evicts enough blocks to make room
+    ///   3. Restores local blocks individually (fast, disk-bound)
+    ///   4. Batches ALL remote blocks into ONE pipelined fetch_batch()
+    ///
+    /// Use case: LLM loading a transformer layer (sequential blocks, mostly on RAM B).
+    /// With 10 blocks on remote, pipeline = 1 RTT instead of 10.
+    pub fn simulate_read_batch(&mut self, block_indices: &[usize]) -> Vec<FaultResult> {
+        let t0 = Instant::now();
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+        // Partition blocks by current location
+        let mut already_resident = Vec::new();
+        let mut need_local_restore = Vec::new();
+        let mut need_remote_fetch = Vec::new();
+        let mut need_virgin_fill = Vec::new();
+
+        for &idx in block_indices {
+            if idx >= self.blocks.len() { continue; }
+            match &self.blocks[idx].location {
+                BlockLocation::Resident => already_resident.push(idx),
+                BlockLocation::LocalStore { .. } => need_local_restore.push(idx),
+                BlockLocation::RemoteKernel { .. } => need_remote_fetch.push(idx),
+                BlockLocation::Virgin => need_virgin_fill.push(idx),
+                BlockLocation::Fetching => {} // skip, already in progress
+            }
+        }
+
+        let total_to_restore = need_local_restore.len() + need_remote_fetch.len() + need_virgin_fill.len();
+
+        // Evict enough blocks to make room for all restores
+        let resident = self.resident_count.load(Ordering::Relaxed) as usize;
+        let max = self.config.max_resident_blocks;
+        let need_slots = total_to_restore.saturating_sub(max.saturating_sub(resident));
+
+        for _ in 0..need_slots {
+            let _ = self.evict_coldest();
+        }
+
+        let mut results: Vec<FaultResult> = Vec::with_capacity(block_indices.len());
+
+        // 1. Already resident — just update access stats
+        for idx in &already_resident {
+            self.blocks[*idx].access_count += 1;
+            self.blocks[*idx].last_access_ns = now_ns;
+            results.push(FaultResult::AlreadyResident { block_index: *idx });
+        }
+
+        // 2. Virgin blocks — zero fill (instant)
+        for idx in &need_virgin_fill {
+            self.blocks[*idx].location = BlockLocation::Resident;
+            self.blocks[*idx].access_count = 1;
+            self.blocks[*idx].last_access_ns = now_ns;
+            self.resident_count.fetch_add(1, Ordering::AcqRel);
+            self.zero_pages_served.fetch_add(1, Ordering::Relaxed);
+            self.faults_handled.fetch_add(1, Ordering::Relaxed);
+            results.push(FaultResult::ZeroFilled { block_index: *idx, inject_us: 0 });
+        }
+
+        // 3. Local restore — one by one (disk-bound, fast)
+        for idx in &need_local_restore {
+            results.push(self.restore_block(*idx, now_ns));
+        }
+
+        // 4. Remote fetch — BATCHED via pipelined MUX
+        if !need_remote_fetch.is_empty() {
+            let batch_results = self.batch_restore_remote(&need_remote_fetch, now_ns);
+            results.extend(batch_results);
+        }
+
+        results
+    }
+
+    /// Batch restore remote blocks via pipelined fetch_batch().
+    ///
+    /// Sends ALL fetch requests in one burst, then reads ALL responses.
+    /// On a 1ms RTT link, 10 blocks = 1ms instead of 10ms.
+    fn batch_restore_remote(&mut self, block_indices: &[usize], now_ns: u64) -> Vec<FaultResult> {
+        let bus_seq_base = self.bus_seq.fetch_add(block_indices.len() as u64, Ordering::SeqCst);
+
+        if let Some(client) = &self.mux_client {
+            let c = client.clone();
+
+            // Build request list: (block_index, bus_seq)
+            let requests: Vec<(usize, u64)> = block_indices.iter()
+                .enumerate()
+                .map(|(i, &idx)| (idx, bus_seq_base + i as u64))
+                .collect();
+
+            let t0 = Instant::now();
+            let fetch_results = block_on_safe(c.fetch_batch(&requests));
+            let batch_us = t0.elapsed().as_micros() as u64;
+
+            match fetch_results {
+                Ok(fetched) => {
+                    let mut results = Vec::with_capacity(fetched.len());
+                    let per_block_us = batch_us / fetched.len().max(1) as u64;
+
+                    for (block_index, data, _elapsed) in fetched {
+                        // Verify integrity
+                        if let Some(ref expected) = self.blocks[block_index].content_hash {
+                            let computed = sha256_hex(&data);
+                            if computed != *expected {
+                                results.push(FaultResult::Failed {
+                                    block_index,
+                                    reason: format!("Batch integrity failed: expected {}, got {}", expected, computed),
+                                });
+                                continue;
+                            }
+                        }
+
+                        self.blocks[block_index].location = BlockLocation::Resident;
+                        self.blocks[block_index].access_count += 1;
+                        self.blocks[block_index].last_access_ns = now_ns;
+                        self.blocks[block_index].dirty = false;
+                        self.resident_count.fetch_add(1, Ordering::AcqRel);
+                        self.bytes_decompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        self.remote_transfers.fetch_add(1, Ordering::Relaxed);
+                        self.faults_handled.fetch_add(1, Ordering::Relaxed);
+
+                        results.push(FaultResult::RestoredRemote {
+                            block_index,
+                            fetch_us: per_block_us,
+                            decompress_us: 0,
+                            verify_us: 0,
+                            inject_us: 0,
+                            total_us: per_block_us,
+                        });
+                    }
+                    results
+                }
+                Err(e) => {
+                    // Fallback: restore one by one
+                    block_indices.iter().map(|&idx| {
+                        FaultResult::Failed {
+                            block_index: idx,
+                            reason: format!("Batch fetch failed: {}", e),
+                        }
+                    }).collect()
+                }
+            }
+        } else {
+            // No MUX client — fall back to individual restore
+            block_indices.iter().map(|&idx| {
+                self.restore_block(idx, now_ns)
+            }).collect()
+        }
+    }
+
+    /// Prefetch: proactively load blocks that will be needed soon.
+    ///
+    /// Use case: LLM inference reads layers sequentially. When layer N is accessed,
+    /// prefetch layers N+1..N+K from RAM B so they're already resident when needed.
+    ///
+    /// Returns: (prefetched_count, total_fetch_us)
+    pub fn prefetch(&mut self, block_indices: &[usize]) -> (usize, u64) {
+        let t0 = Instant::now();
+
+        // Filter to only non-resident blocks
+        let to_prefetch: Vec<usize> = block_indices.iter()
+            .filter(|&&idx| idx < self.blocks.len())
+            .filter(|&&idx| self.blocks[idx].location != BlockLocation::Resident)
+            .copied()
+            .collect();
+
+        if to_prefetch.is_empty() {
+            return (0, 0);
+        }
+
+        let results = self.simulate_read_batch(&to_prefetch);
+        let ok_count = results.iter()
+            .filter(|r| !matches!(r, FaultResult::Failed { .. }))
+            .count();
+
+        (ok_count, t0.elapsed().as_micros() as u64)
+    }
+
     /// Get comprehensive statistics.
     pub fn stats(&self) -> RaidStats {
         let resident = self.resident_count.load(Ordering::Relaxed) as usize;
@@ -1042,4 +1509,31 @@ pub struct RaidStats {
     pub remote_transfers: u64,
     pub zero_pages_served: u64,
     pub has_remote_ram_b: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Helper — synchronous BlockStore fetch (avoids async in sync context)
+// ═══════════════════════════════════════════════════════════════
+
+fn handle_block_on_local(store: &Arc<BlockStore>, block_index: usize) -> Option<Vec<u8>> {
+    block_on_safe(async {
+        store.fetch(block_index).await.map(|b| b.data)
+    })
+}
+
+/// Execute an async future from sync code, handling both inside-tokio and outside-tokio contexts.
+/// Inside tokio: uses block_in_place + Handle::block_on (requires multi-threaded runtime).
+/// Outside tokio: creates a temporary runtime.
+pub fn block_on_safe<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // We're inside a tokio runtime — use block_in_place to avoid panic
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        // We're outside tokio — create a temporary runtime
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create temp runtime");
+        rt.block_on(future)
+    }
 }

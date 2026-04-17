@@ -47,6 +47,30 @@ rayon = "1.10"              # Multi-core parallel sealing/opening
 name = "tibet-bench"
 path = "src/bin/tibet_bench.rs"
 
+[[bin]]
+name = "dual-kernel-demo"
+path = "src/bin/dual_kernel_demo.rs"
+
+[[bin]]
+name = "cluster-paging-demo"
+path = "src/bin/cluster_paging_demo.rs"
+
+[[bin]]
+name = "cluster-transport-demo"
+path = "src/bin/cluster_transport_demo.rs"
+
+[[bin]]
+name = "portmux-xdp-demo"
+path = "src/bin/portmux_xdp_demo.rs"
+
+[[bin]]
+name = "ram-raid-cluster-demo"
+path = "src/bin/ram_raid_cluster_demo.rs"
+
+[[bin]]
+name = "llm-mapper-demo"
+path = "src/bin/llm_mapper_demo.rs"
+
 [[bench]]
 name = "airlock_bench"
 harness = false
