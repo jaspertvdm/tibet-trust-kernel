@@ -2,27 +2,34 @@
 name = "tibet-trust-kernel"
 version = "1.0.0-alpha"
 edition = "2021"
-description = "Dual-kernel zero-trust sandbox — Voorproever + Archivaris + UPIP + RAM RAID-0, cryptographic proof of every execution"
+description = "Zero-Trust DGX — Cross-machine AI memory virtualization. DIME aperture maps LLMs across servers via userfaultfd + encrypted RAID-0. No NVLink required."
 license = "MIT"
 authors = ["Jasper van de Meent <jasper@humotica.com>", "Root AI <root_idd@humotica.nl>"]
-keywords = ["trust-kernel", "microvm", "sandbox", "security", "tibet"]
-categories = ["command-line-utilities", "development-tools"]
-repository = "https://github.com/humotica/trust-kernel"
+keywords = ["ai-memory", "cross-machine", "llm-inference", "userfaultfd", "tibet"]
+categories = ["science", "hardware-support", "memory-management"]
+repository = "https://github.com/Humotica/tibet-trust-kernel"
+homepage = "https://ainternet.org"
 readme = "README.md"
-publish = false  # Niet publiceren — eerst laptop-testen!
+# publish = true  # Klaar na hardware test op P520 ↔ DL360
 
 [package.metadata.docs.rs]
-features = ["kvm"]
+features = ["kvm", "cluster", "llm"]
 
-# NOTE: The `kvm` feature enables real kernel isolation via Ignition
-# (https://lttle.cloud / https://github.com/nicholasgasior/ignition)
-# Ignition is not yet on crates.io — use path/git dependency when building with KVM:
-#   ignition = { git = "https://github.com/nicholasgasior/ignition" }
-
+# ═══════════════════════════════════════════════════════════════
+# Features — pick what you need
+# ═══════════════════════════════════════════════════════════════
+#
+# tibet-trust-kernel = { version = "1.0", features = ["cluster"] }   # Cross-machine RAM
+# tibet-trust-kernel = { version = "1.0", features = ["llm"] }       # LLM Memory Mapper
+# tibet-trust-kernel = { version = "1.0", features = ["full"] }      # Everything
+#
 [features]
-default = ["simulation"]
+default = ["simulation", "cluster", "llm"]
 simulation = []                    # Simulated KVM — for testing without hardware
-kvm = []                           # Real Ignition KVM — requires /dev/kvm + ignition crate
+kvm = []                           # Real Ignition KVM — requires /dev/kvm
+cluster = []                       # Cross-machine RAM RAID-0 + ClusterMux transport
+llm = ["cluster"]                  # LLM Memory Mapper (DIME aperture) — implies cluster
+full = ["cluster", "llm"]          # All features
 
 [dependencies]
 userfaultfd = "0.8.1"
