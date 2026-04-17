@@ -1,89 +1,99 @@
 # tibet-trust-kernel
 
-Zero-Trust DGX — Cross-machine AI memory virtualization. Run LLMs larger than your RAM by transparently mapping model blocks across servers via userfaultfd + encrypted RAID-0. No NVLink required.
+Zero-trust security foundation for AI infrastructure. AES-256-GCM encryption, cryptographic integrity verification, and cross-machine memory transport — every byte proven, every execution isolated.
 
 ## What it does
 
-Maps AI model memory across multiple machines using the **DIME Aperture** pattern (inspired by 3dfx Voodoo AGP texture aperture). Blocks start as unmapped spaceholders, materialize on-demand via page faults, and stream over TCP with SHA-256 integrity + AES-256-GCM encryption.
+tibet-trust-kernel provides the security primitives that AI systems need to operate in zero-trust environments:
 
-```
-Page fault → MUX fetch from RAM B → SHA-256 verify → uffd.copy() → block resident
-2nd+ access → hash cache hit → SHA-256 skipped → 14x faster
-```
+- **Bifurcation** — AES-256-GCM encrypt/decrypt with X25519 key exchange. Data at rest is always encrypted.
+- **Airlock** — Sandboxed execution with SNAFT syscall monitoring. Kill or Safe, no middle ground.
+- **ClusterMux** — Persistent multiplexed TCP transport with streaming SHA-256 integrity verification.
+- **Hash Cache** — Skip SHA-256 on previously verified blocks. 14x speedup, zero trust compromise.
+- **DIME Aperture** — Virtual memory mapping for large datasets across machines (used by [tibet-dgx](https://github.com/Humotica/tibet-dgx) for LLM inference).
+- **RAM RAID-0** — Stripe data across machines with userfaultfd page fault handling.
+- **UPIP Pager** — Crypto-safe application-level paging with fork tokens for cross-device continuation.
 
-## Hardware-tested performance
+## Install
 
-Tested with real Qwen 2.5 7B model (4.36GB) over P520 (64GB) ↔ DL360 (64GB) direct 10Gbps:
+```toml
+# Security primitives only
+tibet-trust-kernel = "1.0.0-alpha"
 
-| Metric | Result |
-|--------|--------|
-| Ping RTT (10Gbps direct) | 0.17ms |
-| Store to RAM B | 33 MB/s (sequential) |
-| Restore + Verify | 112 MB/s |
-| Hash cache hit rate | 100% |
-| SHA-256 bytes saved | 2.4 GB |
-| Block integrity | 2234/2234 verified |
+# With cross-machine transport
+tibet-trust-kernel = { version = "1.0.0-alpha", features = ["cluster"] }
 
-Combined RAM: 128GB — a 70B Q4_K_M model (40GB) fits entirely.
-
-## Quick start
-
-```rust
-// Cargo.toml
-tibet-trust-kernel = { version = "1.0.0-alpha", features = ["llm"] }
+# Everything including LLM mapper
+tibet-trust-kernel = { version = "1.0.0-alpha", features = ["full"] }
 ```
 
 ```bash
-# Server (DL360 — RAM B provider)
-ram-raid-cluster-demo server 0.0.0.0:4432
-
-# Client (P520 — runs inference)
-ram-raid-cluster-demo client 10.0.100.1:4432
-
-# LLM Mapper demo
-llm-mapper-demo quick    # 48MB simulation
-llm-mapper-demo 70b      # 40GB aperture map
-
-# Real GGUF model test
-gguf-raid-test /path/to/model.gguf 10.0.100.1:4432
+cargo install tibet-trust-kernel
 ```
 
 ## Features
 
-```toml
-tibet-trust-kernel = { version = "1.0", features = ["cluster"] }   # Cross-machine RAM
-tibet-trust-kernel = { version = "1.0", features = ["llm"] }       # LLM Memory Mapper
-tibet-trust-kernel = { version = "1.0", features = ["full"] }      # Everything
+| Feature | Description |
+|---------|-------------|
+| `simulation` | Default — simulated KVM for testing |
+| `kvm` | Real Ignition KVM microVM isolation |
+| `cluster` | Cross-machine RAM RAID-0 + ClusterMux transport |
+| `llm` | LLM Memory Mapper (DIME aperture), implies cluster |
+| `full` | All features |
+
+## Quick start
+
+### Bifurcation — Encrypt everything
+
+```rust
+use tibet_trust_kernel::bifurcation::AirlockBifurcation;
+
+let bifurcation = AirlockBifurcation::new_paranoid();
+let sealed = bifurcation.seal(b"sensitive data", "block-0");
+let opened = bifurcation.open(&sealed, "block-0");
+assert_eq!(opened, b"sensitive data");
 ```
 
-- `cluster` — Cross-machine RAM RAID-0 + ClusterMux transport
-- `llm` — LLM Memory Mapper (DIME aperture), implies cluster
-- `simulation` (default) — Simulated KVM for testing
-- `kvm` — Real Ignition KVM isolation
+### ClusterMux — Cross-machine transport
+
+```rust
+use tibet_trust_kernel::cluster_mux::ClusterMuxClient;
+
+let client = ClusterMuxClient::new("10.0.100.1:4432", "my-node.aint");
+let rtt = client.ping().await?;
+client.store_block(0, &data, &hash, "seal", data.len(), 0).await?;
+let (block, _us) = client.fetch_block(0, Some(&hash), 0).await?;
+```
 
 ## Modules
 
-| Module | Description | Tests |
-|--------|-------------|-------|
-| `cluster_transport` | TCP-per-block transport, BlockStore | 9 |
-| `cluster_mux` | Persistent MUX, streaming SHA-256, hash cache | 8 |
-| `llm_mapper` | DIME Aperture, model manifests, prefetch | 11 |
-| `ram_raid` | RAID-0 striping, batch restore, uffd | - |
-| `bifurcation` | AES-256-GCM seal/open, X25519 key exchange | 5 |
+| Module | Tests | Description |
+|--------|-------|-------------|
+| `bifurcation` | 5 | AES-256-GCM seal/open, X25519 key exchange, HKDF derivation |
+| `cluster_transport` | 9 | TCP-per-block transport, BlockStore |
+| `cluster_mux` | 8 | Persistent MUX, streaming SHA-256, hash cache |
+| `llm_mapper` | 11 | DIME Aperture, model manifests, prefetch, inference simulation |
+| `ram_raid` | - | RAID-0 striping, batch restore, userfaultfd, prefetch |
+| `airlock_vmm` | 4 | Sandboxed execution, SNAFT monitoring |
+| `upip_pager` | 6 | Application-level paging, fork tokens |
+| `portmux` | 3 | Port multiplexing |
+| `seccomp` | 2 | Seccomp-BPF sandbox |
 
-## Key concepts
+## For LLM inference
 
-- **DIME Aperture**: Virtual address space where all model blocks exist as spaceholders. On first access, the block materializes from the remote machine. Like a 3dfx Voodoo AGP texture aperture, but for AI model weights.
+If you want to **run LLMs across machines**, use [tibet-dgx](https://github.com/Humotica/tibet-dgx) — it wraps tibet-trust-kernel into a simple CLI:
 
-- **Hash Cache**: After first SHA-256 verification, the hash is cached. Subsequent loads skip SHA-256 entirely — 14x speedup on repeat access. Store pre-warms the cache (zero misses ever).
-
-- **RAID-0 Striping**: Even blocks stay local (RAM A), odd blocks go remote (RAM B). Combined RAM of both machines available for model loading.
-
-- **Prefetch**: During inference, while processing layer N, layers N+1..N+4 are prefetched in the background. 21/24 layers hit prefetch cache.
+```bash
+cargo install tibet-dgx
+tibet-dgx serve                              # on remote machine
+tibet-dgx load model.gguf -e 10.0.100.1:4432  # on local machine
+```
 
 ## Part of TIBET
 
-tibet-trust-kernel is part of the [TIBET ecosystem](https://pypi.org/project/tibet/) — Traceable Intent-Based Event Tokens. Built by [Humotica](https://humotica.com) for the [AInternet](https://ainternet.org).
+tibet-trust-kernel is the security foundation of the [TIBET ecosystem](https://pypi.org/project/tibet/) — Traceable Intent-Based Event Tokens.
+
+Built by [Humotica](https://humotica.com) for the [AInternet](https://ainternet.org).
 
 ## License
 
