@@ -1,6 +1,6 @@
 [package]
 name = "tibet-trust-kernel"
-version = "1.0.0-alpha"
+version = "1.0.0-alpha.2"
 edition = "2021"
 description = "Zero-trust security foundation — AES-256-GCM encryption, SHA-256 integrity, sandboxed execution, cross-machine memory transport. For finance, IoT, AI, databases, anything zero-trust."
 license = "MIT"
