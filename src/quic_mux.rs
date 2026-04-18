@@ -50,7 +50,7 @@ fn generate_self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
 }
 
 /// Create QUIC server config with self-signed cert.
-fn make_server_config() -> ServerConfig {
+pub fn make_server_config() -> ServerConfig {
     let (certs, key) = generate_self_signed();
 
     let crypto = rustls::ServerConfig::builder()
@@ -76,7 +76,7 @@ fn make_server_config() -> ServerConfig {
 }
 
 /// Create QUIC client config that trusts self-signed certs.
-fn make_client_config() -> ClientConfig {
+pub fn make_client_config() -> ClientConfig {
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
@@ -489,6 +489,12 @@ impl QuicMuxClient {
             streams_opened: AtomicU64::new(0),
             hash_cache: HashCache::new(),
         }
+    }
+
+    /// Ensure we have a live QUIC connection (lazy connect).
+    /// Public so overlay_mux can open raw streams on the connection.
+    pub async fn ensure_connected_pub(&self) -> Result<Connection, MuxError> {
+        self.ensure_connected().await
     }
 
     /// Ensure we have a live QUIC connection (lazy connect).
