@@ -743,6 +743,45 @@ impl OverlayMuxServer {
         *self.handler.lock().await = Some(handler);
     }
 
+    /// Start the server in the background (for demos/tests).
+    /// Returns the port the server is listening on.
+    pub async fn start_background(&self) -> Result<u16, Box<dyn std::error::Error>> {
+        let config = crate::quic_mux::make_server_config();
+        let endpoint = quinn::Endpoint::server(config, self.bind_addr)?;
+        let port = endpoint.local_addr()?.port();
+
+        let handler = self.handler.lock().await.clone();
+        let intents_handled = self.intents_handled.clone();
+        let connections_total = self.connections_total.clone();
+
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                if let Ok(connection) = incoming.await {
+                    connections_total.fetch_add(1, Ordering::Relaxed);
+                    let handler = handler.clone();
+                    let ic = intents_handled.clone();
+
+                    tokio::spawn(async move {
+                        loop {
+                            match connection.accept_bi().await {
+                                Ok(stream) => {
+                                    let h = handler.clone();
+                                    let c = ic.clone();
+                                    tokio::spawn(async move {
+                                        handle_intent_stream(stream, h, c).await.ok();
+                                    });
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        Ok(port)
+    }
+
     /// Start serving — accepts QUIC connections and dispatches intent streams.
     pub async fn serve(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config = crate::quic_mux::make_server_config();
@@ -789,6 +828,16 @@ impl OverlayMuxServer {
 }
 
 /// Handle a single intent stream (one bidi stream = one intent + response).
+/// Public wrapper for use in demo binaries.
+#[cfg(feature = "quic")]
+pub async fn handle_intent_stream_pub(
+    stream: (quinn::SendStream, quinn::RecvStream),
+    handler: Option<IntentHandler>,
+    intents_handled: Arc<AtomicU64>,
+) -> Result<(), MuxError> {
+    handle_intent_stream(stream, handler, intents_handled).await
+}
+
 #[cfg(feature = "quic")]
 async fn handle_intent_stream(
     (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),

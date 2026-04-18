@@ -85,6 +85,10 @@ path = "src/bin/llm_mapper_demo.rs"
 name = "gguf-raid-test"
 path = "src/bin/gguf_raid_test.rs"
 
+[[bin]]
+name = "overlay-mux-demo"
+path = "src/bin/overlay_mux_demo.rs"
+
 [[bench]]
 name = "airlock_bench"
 harness = false
