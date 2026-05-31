@@ -89,6 +89,12 @@ path = "src/bin/gguf_raid_test.rs"
 name = "overlay-mux-demo"
 path = "src/bin/overlay_mux_demo.rs"
 
+# Standalone OSAPI smoke binary — spawns only the v1.1 listeners (verdict + TAT),
+# skips MUX/voorproever/archivaris init. Useful for live e2e demos and CI.
+[[bin]]
+name = "osapi-smoke"
+path = "src/bin/osapi_smoke.rs"
+
 [[bench]]
 name = "airlock_bench"
 harness = false

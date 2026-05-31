@@ -36,3 +36,10 @@ pub mod cluster_mux;
 pub mod quic_mux;
 pub mod overlay_mux;
 pub mod llm_mapper;
+
+// ── OSAPI v1.1 — opt-in TCP/LDJSON side-channel ──
+// Default-OFF; activated via --osapi flag on the daemon. Two listeners:
+//   18443: verdict.v1 ingest (airlock_runtime_verdict.v1 contract)
+//   18444: TAT envelope ingest (intent=request_re_attestation + others)
+pub mod osapi_adapter;
+pub mod tat_consumer;

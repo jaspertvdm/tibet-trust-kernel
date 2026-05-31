@@ -8,10 +8,14 @@ use tibet_trust_kernel::voorproever::{Voorproever, VoorproeverVerdict};
 use tibet_trust_kernel::archivaris::{Archivaris, ArchivarisResult};
 use tibet_trust_kernel::tibet_token::TibetProvenance;
 use tibet_trust_kernel::watchdog::{Watchdog, WatchdogEvent};
-use tibet_trust_kernel::snaft;
+use tibet_trust_kernel::{osapi_adapter, snaft};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ─── Argument inspection (early, before any bind) ───
+    let args: Vec<String> = std::env::args().collect();
+    let osapi_enabled = args.iter().any(|a| a == "--osapi");
+
     // ─── Configuration ───
     let profile = std::env::var("TRUST_KERNEL_PROFILE").unwrap_or_else(|_| "balanced".to_string());
     let config = TrustKernelConfig::from_name(&profile);
@@ -45,6 +49,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─── Start MUX listener ───
     let mut listener = start_mux_listener("127.0.0.1:4430").await?;
     println!("◈ [MUX] Listening on 127.0.0.1:4430\n");
+
+    // ─── OSAPI v1.1 — opt-in TCP/LDJSON side-channel ───
+    // Default-OFF. --osapi opens TCP listeners on 18443 (verdict.v1 ingest)
+    // and 18444 (TAT envelope ingest with biometric vehicle dispatch).
+    // Bolle runtime stays unchanged; OSAPI is the explicit operator/observability path.
+    if osapi_enabled {
+        let host = std::env::var("OSAPI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        match osapi_adapter::spawn_osapi(
+            &host,
+            osapi_adapter::VERDICT_PORT_DEFAULT,
+            osapi_adapter::TAT_PORT_DEFAULT,
+        )
+        .await
+        {
+            Ok(handles) => {
+                println!(
+                    "◈ [OSAPI] v1.1 active on {}:{} (verdict.v1) + {}:{} (TAT envelope)\n",
+                    host,
+                    osapi_adapter::VERDICT_PORT_DEFAULT,
+                    host,
+                    osapi_adapter::TAT_PORT_DEFAULT
+                );
+                // Handles are detached; they run until process exit.
+                std::mem::forget(handles);
+            }
+            Err(e) => {
+                eprintln!("◈ [OSAPI] BIND FAILED ({}); continuing without OSAPI", e);
+            }
+        }
+    }
 
     // Shared state for the connection handler
     let config = Arc::new(config);
