@@ -1,6 +1,6 @@
 [package]
 name = "tibet-trust-kernel"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 edition = "2021"
 description = "Zero-trust security foundation — AES-256-GCM encryption, SHA-256 integrity, sandboxed execution, cross-machine memory transport. For finance, IoT, AI, databases, anything zero-trust."
 license = "MIT"
@@ -88,6 +88,9 @@ path = "src/bin/gguf_raid_test.rs"
 [[bin]]
 name = "overlay-mux-demo"
 path = "src/bin/overlay_mux_demo.rs"
+# Uses OverlayMux + OverlayMuxServer which are cfg(feature = "quic") gated.
+# Without this marker, default-features builds (and cargo publish verify) fail.
+required-features = ["quic"]
 
 # Standalone OSAPI smoke binary — spawns only the v1.1 listeners (verdict + TAT),
 # skips MUX/voorproever/archivaris init. Useful for live e2e demos and CI.
