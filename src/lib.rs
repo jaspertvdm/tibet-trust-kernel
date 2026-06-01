@@ -23,6 +23,9 @@ pub mod zandbak;
 
 // ── Storage & recovery ──
 pub mod snapshot;
+// ── Snapshot ACTIVE GATE (v1.2) — snapshot as precondition-for-risk ──
+// Immune-memory must exist BEFORE a risky op is permitted; no-fail-open.
+pub mod snapshot_gate;
 pub mod recovery;
 pub mod git_store;
 pub mod airlock_vmm;
