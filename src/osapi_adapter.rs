@@ -122,7 +122,7 @@ where
 /// bus.stamp_payload + snaft posture update + JSONL audit-log append.
 /// For v1.1 we validate shape + audit-acknowledge so the contract is live
 /// end-to-end on the wire.
-async fn handle_verdict(value: Value, seq: u64) -> OsapiResponse {
+pub(crate) async fn handle_verdict(value: Value, seq: u64) -> OsapiResponse {
     let kind = value
         .get("kind")
         .and_then(|k| k.as_str())
@@ -152,7 +152,7 @@ async fn handle_verdict(value: Value, seq: u64) -> OsapiResponse {
 /// any other TAT envelope) and dispatches biometric vehicle choice.
 /// Production wires this to: trust-kernel key custody + i-poll outbound
 /// to operator .aint device + capability-grant pause until re_attested.
-async fn handle_tat(value: Value, _seq: u64) -> OsapiResponse {
+pub(crate) async fn handle_tat(value: Value, _seq: u64) -> OsapiResponse {
     let tat_version = value
         .get("tat_version")
         .and_then(|v| v.as_str())

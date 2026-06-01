@@ -36,6 +36,16 @@ async fn main() -> std::io::Result<()> {
 
     let _handles = osapi_adapter::spawn_osapi(&host, verdict_port, tat_port).await?;
 
+    // v1.2: --mux also spawns the single-port SSM-routed MUX listener.
+    if args.iter().any(|a| a == "--mux") {
+        let mux_port: u16 = args
+            .windows(2)
+            .find_map(|w| if w[0] == "--mux-port" { w[1].parse().ok() } else { None })
+            .unwrap_or(tibet_trust_kernel::osapi_mux::OSAPI_PORT_DEFAULT);
+        eprintln!("◈   osapi-mux  v1.2 single-port: {}:{}", host, mux_port);
+        let _ = tibet_trust_kernel::osapi_mux::spawn_osapi_mux(&host, mux_port).await?;
+    }
+
     // Park forever; tokio runtime keeps the spawned listeners alive.
     tokio::signal::ctrl_c().await?;
     eprintln!("◈ Ctrl-C — shutting down");

@@ -46,3 +46,7 @@ pub mod llm_mapper;
 //   18444: TAT envelope ingest (intent=request_re_attestation + others)
 pub mod osapi_adapter;
 pub mod tat_consumer;
+// ── OSAPI v1.2 — single-port MUX with SSM-surface routing ──
+// Collapses the v1.1 two-port split into one socket; MUX routes by SSM 4-dot
+// surface (no payload-open), kind-discrimination fallback.
+pub mod osapi_mux;
