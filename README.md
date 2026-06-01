@@ -89,6 +89,56 @@ let (block, _us) = client.fetch_block(0, Some(&hash), 0).await?;
 | `upip_pager` | 6 | Application-level paging, fork tokens |
 | `portmux` | 3 | Port multiplexing |
 | `seccomp` | 2 | Seccomp-BPF sandbox |
+| `snapshot_gate` | 9 | **v1.2** — snapshot ACTIVE GATE (precondition-for-risk) |
+| `osapi_adapter` | 5 | OSAPI v1.1 — verdict.v1 + TAT envelope ingest |
+| `tat_consumer` | 6 | 5-tier biometric vehicle dispatch for re-attestation |
+| `osapi_mux` | 10 | **v1.2** — single-port MUX, SSM-surface routing |
+
+## OSAPI v1.2 — trust gate + single-port mux
+
+Two v1.2 modules harden the capability-grant path. Both are **library-complete and
+unit-tested**; wiring them into the running daemon's default exec path is the next
+roadmap step (today the daemon still exposes the two-port `--osapi` adapter).
+
+### `snapshot_gate` — snapshot as precondition-for-risk
+
+The snapshot is not a backup you restore after a fault — it is the immune-memory that
+must exist *before* a risky operation is permitted. A destructive action cannot
+physically run without fresh immune-memory beneath it.
+
+```rust
+use tibet_trust_kernel::snapshot::SnapshotEngine;
+use tibet_trust_kernel::snapshot_gate::{SnapshotGate, GateContext, RiskClass};
+
+let mut gate = SnapshotGate::new(SnapshotEngine::new("/var/tibet/snapshots", true));
+let ctx = GateContext {
+    snaft_running: true,      // snaft.runtime.running
+    identity_allowed: true,   // jis.identity.verdict == "allowed"
+    bifurcation_ready: true,  // bifurcation.sandbox_clone.ready (destructive only)
+    max_snapshot_age_secs: 60,
+};
+// Risky op: gate allows only with fresh immune-memory; primes one if stale (active).
+let verdict = gate.evaluate(RiskClass::Destructive, &ctx, now_epoch, Some(&mem), "rm-rf", "jis:op");
+// Denied is a HARD stop (no-fail-open) — not a warning.
+```
+
+`gate.snapshot_age_seconds(now)` is the value a snaft rule
+`allow_iff: trust_kernel.snapshot.age_seconds < 60` reads.
+
+### `osapi_mux` — one port, SSM-routed lanes
+
+Collapses the v1.1 two-port split (18443 provenance / 18444 identity) into **one socket**.
+A MUX in front routes each frame by its Semantic Surface Manifest 4-dot label
+(`time.context.profile.priority`) **without opening the payload** — then the lane handler
+verifies the content.
+
+```rust
+use tibet_trust_kernel::osapi_mux::{spawn_osapi_mux, route_by_surface, OSAPI_PORT_DEFAULT};
+
+// one listener, SSM-routed: now.request.genesis-reattest.urgent → Identity lane,
+// now.confirm.genesis-ready.normal → Provenance lane (kind-discrimination fallback).
+let _h = spawn_osapi_mux("127.0.0.1", OSAPI_PORT_DEFAULT).await?;
+```
 
 ## For LLM inference
 
