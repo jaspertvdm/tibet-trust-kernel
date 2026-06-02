@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tibet_trust_kernel::bus::VirtualBus;
@@ -9,6 +9,8 @@ use tibet_trust_kernel::archivaris::{Archivaris, ArchivarisResult};
 use tibet_trust_kernel::tibet_token::TibetProvenance;
 use tibet_trust_kernel::watchdog::{Watchdog, WatchdogEvent};
 use tibet_trust_kernel::{osapi_adapter, snaft};
+use tibet_trust_kernel::snapshot::SnapshotEngine;
+use tibet_trust_kernel::snapshot_gate::{SnapshotGate, GateContext, RiskClass, GateVerdict};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -80,6 +82,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ─── OSAPI v1.2 — single-port MUX (SSM-surface routing) ───
+    // --osapi-mux collapses the v1.1 two-port split into one socket; the MUX routes by
+    // SSM surface (no payload-open). Opt-in alongside --osapi; converges to the default.
+    if args.iter().any(|a| a == "--osapi-mux") {
+        let host = std::env::var("OSAPI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        match tibet_trust_kernel::osapi_mux::spawn_osapi_mux(
+            &host, tibet_trust_kernel::osapi_mux::OSAPI_PORT_DEFAULT,
+        ).await {
+            Ok(handle) => {
+                println!("◈ [OSAPI] v1.2 single-port MUX on {}:{} (SSM-routed)\n",
+                    host, tibet_trust_kernel::osapi_mux::OSAPI_PORT_DEFAULT);
+                std::mem::forget(handle);
+            }
+            Err(e) => eprintln!("◈ [OSAPI-MUX] BIND FAILED ({}); continuing", e),
+        }
+    }
+
+    // ─── Snapshot ACTIVE GATE (v1.2) — precondition-for-risk on the exec-path ───
+    // Benign intents pass straight through (no behavior change). Risky intents get the
+    // immune-memory precondition: a fresh snapshot is primed before commit. Default is
+    // observe/dry-run (logs the verdict, matches voorproever_dryrun discipline); set
+    // TRUST_KERNEL_GATE_ENFORCE=1 to hard-deny (no-fail-open) — flip on in the KIT app.
+    let gate = Arc::new(Mutex::new(SnapshotGate::new(
+        SnapshotEngine::new("/var/tibet/snapshots", false),
+    )));
+    let gate_enforce = std::env::var("TRUST_KERNEL_GATE_ENFORCE").as_deref() == Ok("1");
+    println!("◈ [Gate] Snapshot ACTIVE GATE active (mode: {})\n",
+        if gate_enforce { "ENFORCE (no-fail-open)" } else { "observe/dry-run" });
+
     // Shared state for the connection handler
     let config = Arc::new(config);
 
@@ -95,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bus = bus.clone();
         let watchdog = watchdog.clone();
         let config = config.clone();
+        let gate = gate.clone();
 
         tokio::spawn(async move {
             let t0 = Instant::now();
@@ -164,6 +196,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("◈ [Kernel A] PASS: {} syscalls checked in {:.1}µs (seq={})",
                         syscalls_checked, evaluation_us, bus_payload.seq);
 
+                    // ─── PHASE 3a: Snapshot ACTIVE GATE (v1.2) — precondition-for-risk ───
+                    // Voorproever PASS = snaft + FIR/A cleared, so snaft_running + identity_allowed.
+                    // For a risky intent we prime fresh immune-memory before commit; Benign skips.
+                    let risk = classify_intent(&frame_clone.intent);
+                    if risk != RiskClass::Benign {
+                        let now_epoch = chrono::Utc::now().timestamp();
+                        let ctx = GateContext {
+                            snaft_running: true,        // voorproever PASS
+                            identity_allowed: true,     // FIR/A cleared in PASS
+                            bifurcation_ready: true,    // bifurcation primitive available
+                            max_snapshot_age_secs: 60,
+                        };
+                        let region = frame_clone.payload.as_bytes();
+                        let verdict = {
+                            let mut g = gate.lock().unwrap();
+                            g.evaluate(risk, &ctx, now_epoch, Some(region), &frame_clone.intent, &frame_clone.from_aint)
+                        };
+                        match &verdict {
+                            GateVerdict::Allowed { fresh_snapshot_id } => {
+                                println!("◈ [Gate] {:?} ALLOWED (immune-memory: {})",
+                                    risk, fresh_snapshot_id.as_deref().unwrap_or("-"));
+                            }
+                            GateVerdict::Denied { reason } => {
+                                println!("◈ [Gate] {:?} DENIED: {} [{}]", risk, reason,
+                                    if gate_enforce { "ENFORCED" } else { "dry-run, proceeding" });
+                                if gate_enforce {
+                                    let token = TibetProvenance::generate_rejected(&frame_clone,
+                                        &format!("snapshot-gate denied: {}", reason));
+                                    mux::send_response(&mut socket, &frame_clone, &token.to_json(), 403).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
                     // ─── PHASE 3: Bus transfer A → B ───
                     println!("◈ [Bus] Payload seq={} → Kernel B", bus_payload.seq);
 
@@ -209,4 +276,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("◈ ═══════════════════════════════════════════════════════\n");
         });
     }
+}
+
+/// Classify a frame's intent into a RiskClass for the snapshot gate.
+/// Conservative: default Benign (normal traffic passes unchanged); only escalate on
+/// recognized mutation/destruction patterns so legit reads/queries never hit the gate.
+fn classify_intent(intent: &str) -> RiskClass {
+    let i = intent.to_lowercase();
+    const DESTRUCTIVE: &[&str] = &[
+        "rm -rf", "rm-rf", "delete", "destroy", "wipe", "drop ", "drop-",
+        "format", "shutdown", "kill ", "purge", "truncate", "revoke-all", "key-wipe",
+    ];
+    const SENSITIVE: &[&str] = &[
+        "write", "update", "modify", "set ", "create", "exec", "deploy",
+        "grant", "sign", "transfer", "mint", "rotate",
+    ];
+    if DESTRUCTIVE.iter().any(|k| i.contains(k)) {
+        return RiskClass::Destructive;
+    }
+    if SENSITIVE.iter().any(|k| i.contains(k)) {
+        return RiskClass::Sensitive;
+    }
+    RiskClass::Benign
 }
